@@ -16,10 +16,36 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
 from PIL import Image
 import streamlit as st
 
 st.set_page_config(page_title="Nanopore × Optical Trap", page_icon="🔬", layout="wide")
+
+
+def particle_shape(radius_um: float, pore_um: float, rho_um: float, z_um: float,
+                   deformable: bool, max_strain: float) -> tuple[float, float, float, bool]:
+    """Return transverse radius, axial radius, radial strain, and passage feasibility.
+
+    This is a qualitative, volume-conserving oblate/prolate deformation model.
+    Near the pore, the particle contracts in x-y and elongates in z. It may pass
+    only if the radial strain required by the available aperture is no greater
+    than the user-selected maximum strain.
+    """
+    available_radius = max(0.0, pore_um - rho_um)
+    required_strain = max(0.0, 1.0 - available_radius / max(radius_um, 1e-12))
+    can_squeeze = required_strain <= max_strain + 1e-12
+    if not deformable or required_strain <= 0 or not can_squeeze:
+        return radius_um, radius_um, 0.0, required_strain <= 0
+
+    rigid_contact_z = math.sqrt(max(0.0, radius_um**2 - available_radius**2))
+    distance_from_contact = max(0.0, abs(z_um) - rigid_contact_z)
+    engagement = max(0.0, 1.0 - distance_from_contact / max(radius_um, 1e-12))
+    strain = required_strain * engagement
+    transverse = radius_um * (1.0 - strain)
+    # Approximate volume conservation: r_xy^2 * r_z = r_0^3.
+    axial = radius_um**3 / max(transverse**2, 1e-12)
+    return transverse, axial, strain, can_squeeze
 
 
 def simulate(cfg: dict, axes: list[str]) -> pd.DataFrame:
@@ -35,6 +61,8 @@ def simulate(cfg: dict, axes: list[str]) -> pd.DataFrame:
     rows = []
     axis_i = {"x": 0, "y": 1, "z": 2}
     f_gravity = np.zeros(3)
+    pore_clearance_um = pore_um - radius_um
+    max_strain = cfg["max_radial_strain_pct"] / 100.0
     if cfg["gravity_enabled"]:
         direction = cfg["gravity_direction"]
         sign = 1.0 if direction[0] == "+" else -1.0
@@ -79,9 +107,43 @@ def simulate(cfg: dict, axes: list[str]) -> pd.DataFrame:
 
         sigma = math.sqrt(0.016 * cfg["temperature_k"] / 298 * dt / gamma) if cfg["brownian"] else 0
         brownian_step = rng.normal(0, sigma, 3)
-        pos = pos + (f_det / gamma) * dt + brownian_step
-        if pos[2] < -0.35:  # simple membrane collision boundary
-            pos[2] = -0.35 + abs(pos[2] + 0.35) * 0.25
+        displacement = (f_det / gamma) * dt + brownian_step
+        # Spatial sub-step limiter: prevents a large force or Brownian kick from
+        # teleporting the particle across the membrane in one animation frame.
+        max_displacement = 0.12 * max(0.02, min(radius_um, pore_um))
+        displacement_norm = np.linalg.norm(displacement)
+        if displacement_norm > max_displacement:
+            displacement *= max_displacement / displacement_norm
+        proposed_pos = pos + displacement
+
+        proposed_rho = math.hypot(proposed_pos[0], proposed_pos[1])
+        transverse_r, axial_r, strain, can_squeeze = particle_shape(
+            radius_um, pore_um, proposed_rho, proposed_pos[2],
+            cfg["deformable_particle"], max_strain)
+        rim_distance = pore_um - proposed_rho
+        if proposed_rho >= pore_um:
+            minimum_center_z = axial_r
+            blocked_by_solid = True
+        elif rim_distance + 1e-12 < transverse_r:
+            minimum_center_z = axial_r * math.sqrt(
+                max(0.0, 1.0 - (rim_distance / max(transverse_r, 1e-12))**2))
+            blocked_by_solid = True
+        else:
+            minimum_center_z = 0.0
+            blocked_by_solid = False
+
+        collided = False
+        # The simulated particle starts above the membrane. Clamp every trial
+        # step that would overlap the solid membrane, preventing time-step
+        # tunnelling even when the deterministic or Brownian step is large.
+        if blocked_by_solid and pos[2] >= 0.0 and proposed_pos[2] < minimum_center_z:
+            proposed_pos[2] = minimum_center_z
+            collided = True
+        pos = proposed_pos
+        final_rho = math.hypot(pos[0], pos[1])
+        transverse_r, axial_r, strain, can_squeeze = particle_shape(
+            radius_um, pore_um, final_rho, pos[2],
+            cfg["deformable_particle"], max_strain)
 
         rows.append({
             "t_ms": i * dt, "x_um": pos[0], "y_um": pos[1], "z_um": pos[2],
@@ -94,6 +156,13 @@ def simulate(cfg: dict, axes: list[str]) -> pd.DataFrame:
             "F_opt_mag_pN": np.linalg.norm(f_opt),
             "F_pore_mag_pN": np.linalg.norm(f_pore), "F_VDW_mag_pN": f_vdw,
             "F_total_mag_pN": np.linalg.norm(f_det),
+            "particle_fits_pore": pore_clearance_um > 0,
+            "pore_clearance_um": pore_clearance_um,
+            "membrane_collision": collided,
+            "particle_transverse_radius_um": transverse_r,
+            "particle_axial_radius_um": axial_r,
+            "particle_radial_strain_pct": 100.0 * strain,
+            "deformation_allows_passage": can_squeeze,
         })
     return pd.DataFrame(rows)
 
@@ -103,8 +172,17 @@ def trajectory_figure(df: pd.DataFrame, pore_radius_um: float) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter3d(x=df.x_um, y=df.y_um, z=df.z_um, mode="lines",
                                name="Trajectory", line=dict(color="#45dfcb", width=5)))
-    fig.add_trace(go.Scatter3d(x=[df.x_um.iloc[-1]], y=[df.y_um.iloc[-1]], z=[df.z_um.iloc[-1]],
-                               mode="markers", name="Particle", marker=dict(size=7, color="#eafffb")))
+    last = df.iloc[-1]
+    u = np.linspace(0, 2*np.pi, 36)
+    v = np.linspace(0, np.pi, 24)
+    uu, vv = np.meshgrid(u, v)
+    rt, rz = last.particle_transverse_radius_um, last.particle_axial_radius_um
+    sx = last.x_um + rt * np.cos(uu) * np.sin(vv)
+    sy = last.y_um + rt * np.sin(uu) * np.sin(vv)
+    sz = last.z_um + rz * np.cos(vv)
+    fig.add_trace(go.Surface(x=sx, y=sy, z=sz, name="Particle", showscale=False,
+                             colorscale=[[0, "#75d8ce"], [1, "#eafffb"]], opacity=.95,
+                             hovertemplate="Deformed particle<extra></extra>"))
     fig.add_trace(go.Scatter3d(x=pore_radius_um*np.cos(th), y=pore_radius_um*np.sin(th),
                                z=np.zeros_like(th), mode="lines", name="Pore rim",
                                line=dict(color="#ff6b8a", width=5)))
@@ -168,8 +246,12 @@ def geometry_figure(cfg: dict, axes: list[str], view: str) -> go.Figure:
                                showarrow=True, arrowcolor=colors[axis], font=dict(color=colors[axis], size=11))
 
     start = np.asarray(cfg["initial_position_um"])
+    radius = cfg["radius_nm"] / 1000
+    fig.add_shape(type="circle", x0=start[ia]-radius, x1=start[ia]+radius,
+                  y0=start[ib]-radius, y1=start[ib]+radius,
+                  line=dict(color="#45dfcb", width=3), fillcolor="rgba(234,255,251,.75)")
     fig.add_scatter(x=[start[ia]], y=[start[ib]], mode="markers+text", name="Initial particle",
-                    marker=dict(size=15, color="white", line=dict(color="#45dfcb", width=3)),
+                    marker=dict(size=4, color="white"),
                     text=[f"start ({start[0]:g}, {start[1]:g}, {start[2]:g}) µm"], textposition="top right")
     fig.add_scatter(x=[0], y=[0], mode="markers+text", name="Origin",
                     marker=dict(size=7, symbol="x", color="#f4bd62"), text=["pore center (0,0,0)"],
@@ -184,7 +266,7 @@ def geometry_figure(cfg: dict, axes: list[str], view: str) -> go.Figure:
 
 
 def force_figure(df: pd.DataFrame) -> go.Figure:
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=.16,
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=.18,
                         subplot_titles=("Signed net-force components", "Magnitude by physical source"))
     component_colors = {"x": "#ffcf5c", "y": "#45dfcb", "z": "#a68cff"}
     for axis in "xyz":
@@ -198,15 +280,46 @@ def force_figure(df: pd.DataFrame) -> go.Figure:
     for key, name, color in sources:
         fig.add_trace(go.Scatter(x=df.t_ms, y=df[key], name=name,
                                  line=dict(color=color, width=2.7, dash="dot" if key == "F_total_mag_pN" else "solid")), row=2, col=1)
-    fig.update_layout(height=620, template="plotly_dark", margin=dict(l=35, r=15, t=55, b=30),
+    fig.update_layout(height=700, template="plotly_dark", margin=dict(l=45, r=20, t=125, b=40),
                       paper_bgcolor="#080d18", plot_bgcolor="#080d18",
                       font=dict(size=14, color="#ffffff"),
-                      legend=dict(orientation="h", y=1.08, font=dict(color="#ffffff")))
+                      legend=dict(orientation="h", x=0, xanchor="left", y=1.22, yanchor="top",
+                                  font=dict(color="#ffffff", size=11),
+                                  bgcolor="rgba(8,13,24,.92)", bordercolor="#3b4966", borderwidth=1))
     fig.update_annotations(font=dict(color="#ffffff", size=15))
     fig.update_xaxes(title_text="Time (ms)", gridcolor="#3b4966", color="#ffffff", row=2, col=1)
     fig.update_yaxes(title_text="Force (pN)", gridcolor="#3b4966", zerolinecolor="#ffffff", color="#ffffff", row=1, col=1)
     fig.update_yaxes(title_text="Magnitude (pN)", gridcolor="#3b4966", color="#ffffff", row=2, col=1)
     return fig
+
+
+def analyze_hovering(df: pd.DataFrame, particle_radius_um: float) -> dict:
+    """Detect Brownian fluctuations around a stable force-balance height."""
+    n_tail = max(40, len(df) // 4)
+    tail = df.tail(n_tail)
+    half = max(1, n_tail // 2)
+    z_mean = float(tail.z_um.mean())
+    z_std = float(tail.z_um.std(ddof=0))
+    z_drift = abs(float(tail.z_um.iloc[:half].mean() - tail.z_um.iloc[half:].mean()))
+    mean_fz = float(tail.F_total_z_pN.mean())
+    force_scale = max(0.02, float(tail.F_total_z_pN.abs().median()))
+    collision_fraction = float(tail.membrane_collision.mean())
+
+    if z_std > 1e-5:
+        restoring_slope = float(np.polyfit(tail.z_um, tail.F_total_z_pN, 1)[0])
+    else:
+        restoring_slope = -np.inf
+
+    above_membrane = z_mean > float(tail.particle_axial_radius_um.mean()) + 0.03
+    low_drift = z_drift < max(0.05, 0.30 * particle_radius_um)
+    localized = z_std < max(0.20, 0.75 * particle_radius_um)
+    near_force_balance = abs(mean_fz) < max(0.05, 0.25 * force_scale)
+    hovering = (above_membrane and low_drift and localized and near_force_balance and
+                restoring_slope < 0 and collision_fraction < 0.05 and
+                not bool((tail.z_um < 0).any()))
+    return dict(hovering=hovering, z_mean_um=z_mean, z_std_um=z_std,
+                z_drift_um=z_drift, mean_fz_pn=mean_fz,
+                restoring_slope_pn_per_um=restoring_slope)
 
 
 def make_gif(df: pd.DataFrame, pore_radius_um: float, view: str = "top") -> bytes:
@@ -218,20 +331,27 @@ def make_gif(df: pd.DataFrame, pore_radius_um: float, view: str = "top") -> byte
     else:
         horizontal, vertical = "x_um", "z_um"
         x_label, y_label = "x (µm)", "z (µm)"
-    x_lim = max(2.2, np.abs(df[horizontal]).max() * 1.12)
+    max_rt = float(df.particle_transverse_radius_um.max())
+    max_rz = float(df.particle_axial_radius_um.max())
+    x_lim = max(2.2, (np.abs(df[horizontal]).max() + max_rt) * 1.12)
     if view == "top":
         y_limits = (-x_lim, x_lim)
     else:
-        z_min = min(-0.55, float(df.z_um.min()) - 0.25)
-        z_max = max(2.2, float(df.z_um.max()) + 0.25)
+        z_min = min(-0.55, float(df.z_um.min()) - max_rz - 0.15)
+        z_max = max(2.2, float(df.z_um.max()) + max_rz + 0.15)
         y_limits = (z_min, z_max)
     frames = []
     for end in sample:
         fig, ax = plt.subplots(figsize=(5, 5), dpi=90)
         fig.patch.set_facecolor("#080d18"); ax.set_facecolor("#080d18")
         ax.plot(df[horizontal].iloc[:end], df[vertical].iloc[:end], color="#45dfcb", lw=1.8)
-        ax.scatter(df[horizontal].iloc[end-1], df[vertical].iloc[end-1],
-                   s=70, c="#eafffb", edgecolors="#45dfcb", zorder=5)
+        row = df.iloc[end-1]
+        rt, rz = row.particle_transverse_radius_um, row.particle_axial_radius_um
+        particle_width = 2 * rt
+        particle_height = 2 * (rt if view == "top" else rz)
+        ax.add_patch(Ellipse((row[horizontal], row[vertical]), particle_width, particle_height,
+                             facecolor="#eafffb", edgecolor="#45dfcb", lw=2.2,
+                             alpha=.95, zorder=5))
         if view == "top":
             ax.add_patch(plt.Circle((0, 0), pore_radius_um, fill=False,
                                     color="#ff6b8a", lw=2))
@@ -278,6 +398,13 @@ with st.sidebar:
                                     help="Dimensionless multiplier for the analytic optical-force proxy.")
     st.subheader("2 · Particle & medium")
     radius = st.number_input("Particle radius (nm)", 5.0, 5000.0, 250.0, 10.0)
+    deformable_particle = st.toggle("Deformable polystyrene particle", True,
+                                    help="Qualitative volume-conserving deformation near the pore.")
+    max_radial_strain_pct = st.number_input(
+        "Maximum radial deformation (%)", 0.0, 40.0, 15.0, 1.0,
+        disabled=not deformable_particle,
+        help="Maximum allowed reduction of the particle radius in the x-y plane. "
+             "This is a phenomenological setting, not a calibrated Young's-modulus calculation.")
     c1, c2 = st.columns(2)
     particle_n = c1.number_input("Particle n", 1.0, 4.5, 1.59, 0.01)
     medium_n = c2.number_input("Medium n", 1.0, 2.5, 1.333, 0.001)
@@ -293,6 +420,16 @@ with st.sidebar:
                         pc3.number_input("Start z (µm)", -2.0, 10.0, 2.2, .1))
     st.subheader("3 · Nanopore")
     pore_radius = st.number_input("Pore radius (nm)", 10.0, 5000.0, 400.0, 10.0)
+    required_on_axis_pct = max(0.0, 100.0 * (1.0 - pore_radius / radius))
+    if radius >= pore_radius:
+        if deformable_particle and required_on_axis_pct <= max_radial_strain_pct:
+            st.warning(f"Rigid particle is larger than the pore, but an on-axis radial deformation "
+                       f"of {required_on_axis_pct:.1f}% can allow passage in this qualitative model.")
+        else:
+            st.error(f"Particle is larger than the pore and needs at least {required_on_axis_pct:.1f}% "
+                     "on-axis radial deformation, above the selected limit. It will be blocked.")
+    else:
+        st.caption(f"Radial passage clearance: {pore_radius - radius:.1f} nm")
     voltage = st.number_input("Voltage (mV)", -1000.0, 1000.0, 120.0, 5.0)
     pressure = st.number_input("Pressure (mbar)", -1000.0, 1000.0, 0.0, 1.0)
     hamaker = st.number_input("Hamaker A (×10⁻²¹ J)", 0.0, 100.0, 6.0, 0.5)
@@ -310,6 +447,7 @@ with st.sidebar:
     run = st.button("Run new trajectory", type="primary", use_container_width=True)
 
 cfg = dict(radius_nm=radius, particle_n=particle_n, density=density, medium_density=medium_density,
+           deformable_particle=deformable_particle, max_radial_strain_pct=max_radial_strain_pct,
            medium_n=medium_n, gravity_enabled=gravity_enabled, gravity_direction=gravity_direction,
            viscosity_mpas=viscosity, temperature_k=temperature, pore_radius_nm=pore_radius,
            voltage_mv=voltage, pressure_mbar=pressure, hamaker_1e21j=hamaker,
@@ -324,13 +462,38 @@ cfg = dict(radius_nm=radius, particle_n=particle_n, density=density, medium_dens
 
 df = simulate(cfg, axes)
 last = df.iloc[-1]; radial = math.hypot(last.x_um, last.y_um)
-captured = radial < pore_radius/1000*1.25 and last.z_um < 1.1
+hover = analyze_hovering(df, radius/1000)
+rigid_fit = radius < pore_radius
+on_axis_deformable_fit = (deformable_particle and
+                          required_on_axis_pct <= max_radial_strain_pct)
+passage_possible = rigid_fit or on_axis_deformable_fit
+current_clearance = pore_radius/1000 - last.particle_transverse_radius_um
+captured = radial <= max(0.0, current_clearance) and 0 <= last.z_um < 1.1
+translocated = passage_possible and last.z_um < 0
+if not passage_possible:
+    state = "Blocked: deformation limit"
+elif translocated:
+    state = "Translocated"
+elif hover["hovering"]:
+    state = "Hovering near pore"
+elif captured:
+    state = "Captured above pore"
+else:
+    state = "Approaching"
 
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Capture state", "Captured" if captured else "Approaching")
+m1.metric("Particle state", state)
 m2.metric("Final radial offset", f"{radial:.3f} µm")
 m3.metric("Peak optical force", f"{df.F_opt_mag_pN.max():.3f} pN")
-m4.metric("Drag coefficient", f"{6*np.pi*viscosity*radius/1000:.2f}")
+m4.metric("Peak radial deformation", f"{df.particle_radial_strain_pct.max():.1f}%")
+if hover["hovering"]:
+    st.success(f"Stable hovering detected at z = {hover['z_mean_um']:.3f} ± "
+               f"{hover['z_std_um']:.3f} µm (mean ± Brownian fluctuation). "
+               f"Mean net Fz = {hover['mean_fz_pn']:.3f} pN and "
+               f"dFz/dz = {hover['restoring_slope_pn_per_um']:.3f} pN/µm.")
+else:
+    st.caption(f"Recent mean height: z = {hover['z_mean_um']:.3f} ± {hover['z_std_um']:.3f} µm; "
+               f"mean net Fz = {hover['mean_fz_pn']:.3f} pN. No stable hovering state detected.")
 
 st.subheader("Geometry layout")
 g1, g2 = st.columns(2)
