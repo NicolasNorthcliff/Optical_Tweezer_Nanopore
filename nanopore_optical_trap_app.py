@@ -108,10 +108,25 @@ def trajectory_figure(df: pd.DataFrame, pore_radius_um: float) -> go.Figure:
     fig.add_trace(go.Scatter3d(x=pore_radius_um*np.cos(th), y=pore_radius_um*np.sin(th),
                                z=np.zeros_like(th), mode="lines", name="Pore rim",
                                line=dict(color="#ff6b8a", width=5)))
-    fig.update_layout(height=570, margin=dict(l=0, r=0, t=25, b=0), template="plotly_dark",
-                      scene=dict(xaxis_title="x (µm)", yaxis_title="y (µm)", zaxis_title="z (µm)",
-                                 bgcolor="#080d18", aspectmode="cube"),
-                      paper_bgcolor="#080d18", legend=dict(orientation="h"))
+    white_axis = dict(
+        title_font=dict(color="#ffffff", size=15),
+        tickfont=dict(color="#ffffff", size=12),
+        color="#ffffff",
+        gridcolor="#3b4966",
+        zerolinecolor="#ffffff",
+    )
+    fig.update_layout(
+        height=570, margin=dict(l=0, r=0, t=25, b=0), template="plotly_dark",
+        font=dict(color="#ffffff", size=13),
+        scene=dict(
+            xaxis=dict(title="x (µm)", **white_axis),
+            yaxis=dict(title="y (µm)", **white_axis),
+            zaxis=dict(title="z (µm)", **white_axis),
+            bgcolor="#080d18", aspectmode="cube",
+        ),
+        paper_bgcolor="#080d18",
+        legend=dict(orientation="h", font=dict(color="#ffffff")),
+    )
     return fig
 
 
@@ -194,19 +209,46 @@ def force_figure(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def make_gif(df: pd.DataFrame, pore_radius_um: float) -> bytes:
+def make_gif(df: pd.DataFrame, pore_radius_um: float, view: str = "top") -> bytes:
+    """Render either an x-y top view or an x-z cross-section trajectory GIF."""
     sample = np.linspace(1, len(df), 60, dtype=int)
-    lim = max(2.2, np.abs(df[["x_um", "y_um"]]).to_numpy().max() * 1.12)
+    if view == "top":
+        horizontal, vertical = "x_um", "y_um"
+        x_label, y_label = "x (µm)", "y (µm)"
+    else:
+        horizontal, vertical = "x_um", "z_um"
+        x_label, y_label = "x (µm)", "z (µm)"
+    x_lim = max(2.2, np.abs(df[horizontal]).max() * 1.12)
+    if view == "top":
+        y_limits = (-x_lim, x_lim)
+    else:
+        z_min = min(-0.55, float(df.z_um.min()) - 0.25)
+        z_max = max(2.2, float(df.z_um.max()) + 0.25)
+        y_limits = (z_min, z_max)
     frames = []
     for end in sample:
         fig, ax = plt.subplots(figsize=(5, 5), dpi=90)
         fig.patch.set_facecolor("#080d18"); ax.set_facecolor("#080d18")
-        ax.plot(df.x_um.iloc[:end], df.y_um.iloc[:end], color="#45dfcb", lw=1.8)
-        ax.scatter(df.x_um.iloc[end-1], df.y_um.iloc[end-1], s=70, c="#eafffb", edgecolors="#45dfcb")
-        ax.add_patch(plt.Circle((0, 0), pore_radius_um, fill=False, color="#ff6b8a", lw=2))
-        ax.set(xlim=(-lim, lim), ylim=(-lim, lim), xlabel="x (µm)", ylabel="y (µm)")
-        ax.set_aspect("equal"); ax.grid(alpha=.15)
-        ax.tick_params(colors="#9ba8c7"); ax.xaxis.label.set_color("#9ba8c7"); ax.yaxis.label.set_color("#9ba8c7")
+        ax.plot(df[horizontal].iloc[:end], df[vertical].iloc[:end], color="#45dfcb", lw=1.8)
+        ax.scatter(df[horizontal].iloc[end-1], df[vertical].iloc[end-1],
+                   s=70, c="#eafffb", edgecolors="#45dfcb", zorder=5)
+        if view == "top":
+            ax.add_patch(plt.Circle((0, 0), pore_radius_um, fill=False,
+                                    color="#ff6b8a", lw=2))
+        else:
+            # Membrane at z=0, drawn as two segments with the nanopore opening between them.
+            ax.plot([-x_lim, -pore_radius_um], [0, 0], color="#f4bd62", lw=7,
+                    solid_capstyle="butt")
+            ax.plot([pore_radius_um, x_lim], [0, 0], color="#f4bd62", lw=7,
+                    solid_capstyle="butt")
+            ax.plot([-pore_radius_um, pore_radius_um], [0, 0], color="#ff6b8a",
+                    lw=2, ls="--")
+        ax.set(xlim=(-x_lim, x_lim), ylim=y_limits, xlabel=x_label, ylabel=y_label)
+        ax.set_aspect("equal", adjustable="box"); ax.grid(alpha=.22, color="#64708a")
+        ax.tick_params(colors="#ffffff")
+        ax.xaxis.label.set_color("#ffffff"); ax.yaxis.label.set_color("#ffffff")
+        ax.set_title("Top view (x–y)" if view == "top" else "Cross-section (x–z)",
+                     color="#ffffff")
         buf = BytesIO(); fig.savefig(buf, format="png", bbox_inches="tight"); plt.close(fig)
         frames.append(Image.open(buf).convert("P", palette=Image.Palette.ADAPTIVE))
     out = BytesIO(); frames[0].save(out, format="GIF", save_all=True, append_images=frames[1:],
@@ -303,18 +345,28 @@ with right:
     st.caption("The relative optical/nanopore magnitude is set by the two calibration factors. "
                "It is not an experimental prediction until those factors are fitted to COMSOL or measured force data.")
 
-with st.spinner("Rendering animated trajectory…"):
-    gif_bytes = make_gif(df, pore_radius/1000)
-st.subheader("Animated top-view trajectory")
-anim, actions = st.columns([1.25, .75])
-with anim:
-    st.image(gif_bytes, caption="Top view · nanopore centered at (0, 0, 0)", use_container_width=True)
-with actions:
+with st.spinner("Rendering top-view and cross-section trajectories…"):
+    top_gif_bytes = make_gif(df, pore_radius/1000, "top")
+    cross_gif_bytes = make_gif(df, pore_radius/1000, "cross")
+st.subheader("Animated trajectories")
+top_anim, cross_anim = st.columns(2)
+with top_anim:
+    st.image(top_gif_bytes, caption="Top view (x–y) · nanopore centered at (0, 0, 0)",
+             use_container_width=True)
+with cross_anim:
+    st.image(cross_gif_bytes, caption="Cross-section (x–z) · membrane and pore opening at z = 0",
+             use_container_width=True)
+
+info, actions = st.columns([1.25, .75])
+with info:
     st.info(f"Initial particle: ({initial_position[0]:g}, {initial_position[1]:g}, {initial_position[2]:g}) µm\n\n"
             + "\n\n".join(f"{a.upper()} beam: {powers[a]:g} mW, w₀={waists[a]:g} µm, focus={focuses[a]}" for a in axes))
+with actions:
     st.download_button("Download trajectory CSV", df.to_csv(index=False).encode(),
                        "nanopore_trajectory.csv", "text/csv", use_container_width=True)
-    st.download_button("Download trajectory GIF", gif_bytes, "nanopore_trajectory.gif",
+    st.download_button("Download top-view GIF", top_gif_bytes, "nanopore_trajectory_top.gif",
+                       "image/gif", use_container_width=True)
+    st.download_button("Download cross-section GIF", cross_gif_bytes, "nanopore_trajectory_cross_section.gif",
                        "image/gif", use_container_width=True)
 
 with st.expander("Model equation and limitations"):
